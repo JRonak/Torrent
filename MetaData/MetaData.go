@@ -33,6 +33,10 @@ func makeError(str string) error {
 	return errors.New("Meta:" + str)
 }
 
+func (m *MetaInfo) Size() int {
+	return int(legnth(*m))
+}
+
 func legnth(m MetaInfo) float64 {
 	var f float64
 	if m.Info.Length != 0 {
@@ -62,7 +66,7 @@ func verfiy(m MetaInfo) bool {
 	return verifyPieces(m)
 }
 
-func Meta(str string) (MetaInfo, error) {
+func BuildMetaData(str string) (MetaInfo, error) {
 	m := MetaInfo{}
 	if str == "" {
 		return m, makeError("Empty input string")
