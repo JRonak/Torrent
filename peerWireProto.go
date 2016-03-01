@@ -30,17 +30,17 @@ const (
 
 var (
 	currentPeers int32
+	currentPiece int32
 )
 
 func init() {
-	currentPeers = 0
 	go trace()
 }
 
 func trace() {
 	for {
 		<-time.After(time.Second * 2)
-		fmt.Println("Current Peers", atomic.LoadInt32(&currentPeers))
+		fmt.Printf("\rResult:%d", atomic.LoadInt32(&currentPiece))
 	}
 }
 
@@ -49,6 +49,7 @@ type Piece struct {
 	Size   int    //Size of the piece
 	offset int    //Offset in the piece
 	Data   []byte //Downloaded piece
+	stamp  time.Time
 }
 
 type PieceRequest struct {
@@ -67,6 +68,7 @@ type PeerClient struct {
 	interested      bool
 	choked          bool
 	piecesAvailable []byte
+	writeChan       chan []byte
 }
 
 type HandshakeData struct {
@@ -78,6 +80,7 @@ type HandshakeData struct {
 }
 
 func (this *PeerClient) Intialize() {
+	this.writeChan = make(chan []byte, 10)
 	this.piece.Id = -1
 	this.piecesAvailable = make([]byte, 56)
 	con, err := net.DialTimeout("tcp", Address(this.Peer.Ip, this.Peer.Port), time.Second*5)
@@ -120,6 +123,8 @@ func (this *PeerClient) Handshake() {
 		log.Println("PeerClient Handshake failed")
 		runtime.Goexit()
 	}
+	this.manager.registerPeer(this)
+	go this.write()
 	this.HandleResponse()
 }
 
@@ -133,7 +138,7 @@ func (this *PeerClient) BitField(size int) {
 		return
 	}
 	this.piecesAvailable = data
-	this.findPieceToDownload()
+	this.manager.findPiece(this)
 }
 
 //Incomplete function
@@ -163,37 +168,41 @@ func (this *PeerClient) Have() {
 	buffer := bytes.NewBuffer(data)
 	binary.Read(buffer, binary.BigEndian, &x)
 	if len(this.piecesAvailable) > int((x / 8)) {
-		this.piecesAvailable[x/8] |= 1 << (7 - uint(x%8))
+		this.piecesAvailable[x/8] |= (1 << (7 - uint(x%8)))
 	} else {
 		fmt.Println("Have message out of bound:", x, " len of the pieces", len(this.piecesAvailable))
 	}
 }
 
-func (this *PeerClient) findPieceToDownload() {
+func (this *PeerClient) back() {
+	m := &this.manager.Blocks
+	size := len(this.manager.MetaData.Info.Pieces) / 20
+	m.Lock.Lock()
+	avail := m.AvailablePieces
+	locked := m.LockedPieces
 	t := false
-	fmt.Println("locked")
-	for i := range this.manager.Blocks.AvailablePieces {
-		x := this.manager.Blocks.AvailablePieces[i] ^ this.piecesAvailable[i]
-		if x != 0 {
-			x ^= this.manager.Blocks.LockedPieces[i]
-			if x != 0 {
-				for j := 0; j < 8; j++ {
-					if x&(1<<uint(7-j)) != 0 {
-						this.manager.Blocks.LockedPieces[i] |= 1 << uint(7-j)
-						fmt.Println(this.manager.Blocks.LockedPieces[i])
-						this.piece.Id = i*8 + j
-						this.SendPieceRquest()
-						t = true
-						break
-					}
-				}
-				if t {
-					break
-				}
+	for i := range avail {
+		for j := 0; j < 8; j++ {
+			y := (i * 8) + j
+			if y >= size {
+				break
+			}
+			availBit := avail[i] & (1 << uint(7-j))
+			lockedBit := locked[i] & (1 << uint(7-j))
+			pieceBit := this.piecesAvailable[i] & (1 << uint(7-j))
+			if availBit == 0 && lockedBit == 0 && pieceBit != 0 {
+				this.piece.Id = i*8 + j
+				this.SendPieceRquest()
+				m.LockedPieces[i] |= (1 << uint(7-j))
+				t = true
+				break
 			}
 		}
+		if t {
+			break
+		}
 	}
-	fmt.Println("here")
+	m.Lock.Unlock()
 
 }
 
@@ -212,7 +221,16 @@ func (this *PeerClient) Piece(size int) {
 	if err != nil {
 		return
 	}
-	fmt.Println("recived piece", t)
+	this.manager.Blocks.Lock.Lock()
+	if (this.manager.Blocks.AvailablePieces[t.Id/8] & (1 << uint(7-t.Id%8))) == 0 {
+		this.manager.Blocks.AvailablePieces[t.Id/8] |= (1 << uint(7-t.Id%8))
+		this.manager.s.PutBlock(data[8:], int(t.Id))
+		atomic.AddInt32(&currentPiece, 1)
+		fmt.Println(t.Id)
+	}
+	this.manager.Blocks.Lock.Unlock()
+	this.piece.Id = -1
+	this.manager.findPiece(this)
 }
 
 func (this *PeerClient) read(length int, duration time.Duration) ([]byte, error) {
@@ -242,7 +260,7 @@ func (this *PeerClient) read(length int, duration time.Duration) ([]byte, error)
 }
 
 func (this *PeerClient) SendInterested() {
-	this.write([]byte{2})
+	this.writeChan <- []byte{2}
 	this.interested = true
 }
 
@@ -251,7 +269,7 @@ func (this *PeerClient) SendPieceRquest() {
 		this.SendInterested()
 	}
 	p := PieceRequest{
-		Size:   16384,
+		Size:   int32(this.piece.Size),
 		Id:     int32(this.piece.Id),
 		Offset: int32(this.piece.offset)}
 	buf := bytes.NewBuffer([]byte{6})
@@ -260,24 +278,31 @@ func (this *PeerClient) SendPieceRquest() {
 		fmt.Println("SendPiece:", err.Error())
 		return
 	}
-	this.write(buf.Bytes())
+	this.writeChan <- buf.Bytes()
 }
 
-func (this *PeerClient) write(data []byte) {
-	length := int32(len(data))
-	conn := this.Conn
-	err := binary.Write(conn, binary.BigEndian, length)
-	if err != nil {
-		return
-	}
-	size := len(data)
-	for count := 0; count < size; {
-		n, err := conn.Write(data[(count):])
+func (this *PeerClient) write() {
+	for data := range this.writeChan {
+		length := int32(len(data))
+		conn := this.Conn
+		err := binary.Write(conn, binary.BigEndian, length)
 		if err != nil {
 			return
 		}
-		count += n
+		size := len(data)
+		for count := 0; count < size; {
+			n, err := conn.Write(data[(count):])
+			if err != nil {
+				return
+			}
+			count += n
+		}
 	}
+}
+
+func (this *PeerClient) kill() {
+	this.Conn.Close()
+	close(this.writeChan)
 }
 
 // Handles all the Peer Wire protocol messages
