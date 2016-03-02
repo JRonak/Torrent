@@ -9,12 +9,13 @@ import (
 	"log"
 	"net"
 	"runtime"
-	"sync/atomic"
+	"sync"
 	"time"
 )
 
 const (
-	retryCount = 1
+	RETRYCOUNT = 1
+	BLOCKSIZE  = 16384
 )
 
 const (
@@ -28,28 +29,14 @@ const (
 	PIECE
 )
 
-var (
-	currentPeers int32
-	currentPiece int32
-)
-
-func init() {
-	go trace()
-}
-
-func trace() {
-	for {
-		<-time.After(time.Second * 2)
-		fmt.Printf("\rResult:%d", atomic.LoadInt32(&currentPiece))
-	}
-}
-
 type Piece struct {
-	Id     int    //Index of the piece
-	Size   int    //Size of the piece
-	offset int    //Offset in the piece
-	Data   []byte //Downloaded piece
-	stamp  time.Time
+	Id        int           //Index of the piece
+	BlockSize int           //Size  of the block
+	PieceSize int           //Size  of the piece
+	Offset    int           //Offset in the piece
+	Data      *bytes.Buffer //Downloaded piece
+	Stamp     time.Time
+	Lock      sync.Mutex
 }
 
 type PieceRequest struct {
@@ -60,14 +47,14 @@ type PieceRequest struct {
 
 type PeerClient struct {
 	Conn            net.Conn
-	Peer            tracker.Peer
+	PeerId          [20]byte
 	manager         *Manager
 	piece           Piece
 	peerInterested  bool
 	peerChoked      bool
 	interested      bool
 	choked          bool
-	piecesAvailable []byte
+	piecesAvailable BitMap
 	writeChan       chan []byte
 }
 
@@ -79,19 +66,16 @@ type HandshakeData struct {
 	PeerId     [20]byte
 }
 
-func (this *PeerClient) Intialize() {
+func (this *PeerClient) Intialize(peer tracker.Peer) {
 	this.writeChan = make(chan []byte, 10)
 	this.piece.Id = -1
-	this.piecesAvailable = make([]byte, 56)
-	con, err := net.DialTimeout("tcp", Address(this.Peer.Ip, this.Peer.Port), time.Second*5)
+	this.piece.Offset = 0
+	this.piece.Data = bytes.NewBuffer(nil)
+	con, err := net.DialTimeout("tcp", Address(peer.Ip, peer.Port), time.Second*5)
 	if err != nil {
 		runtime.Goexit()
 	}
 	this.Conn = con
-	this.Handshake()
-}
-
-func (this *PeerClient) Handshake() {
 	h := HandshakeData{}
 	h.Infohash = this.manager.InfoHash
 	h.NameLength = 19
@@ -100,7 +84,7 @@ func (this *PeerClient) Handshake() {
 	for i := 0; i < 19; i++ {
 		h.Protocol[i] = byte(s[i])
 	}
-	err := binary.Write(this.Conn, binary.LittleEndian, h)
+	err = binary.Write(this.Conn, binary.LittleEndian, h)
 	if err != nil {
 		log.Println("PeerClient - Handshake:" + err.Error())
 		runtime.Goexit()
@@ -123,8 +107,13 @@ func (this *PeerClient) Handshake() {
 		log.Println("PeerClient Handshake failed")
 		runtime.Goexit()
 	}
-	this.manager.registerPeer(this)
+	this.PeerId = response.PeerId
+	if this.manager.registerPeer(this) == false {
+		this.Conn.Close()
+		runtime.Goexit()
+	}
 	go this.write()
+	this.SendInterested()
 	this.HandleResponse()
 }
 
@@ -137,7 +126,7 @@ func (this *PeerClient) BitField(size int) {
 		fmt.Println(err)
 		return
 	}
-	this.piecesAvailable = data
+	this.piecesAvailable.Set(data)
 	this.manager.findPiece(this)
 }
 
@@ -167,43 +156,7 @@ func (this *PeerClient) Have() {
 	var x int32
 	buffer := bytes.NewBuffer(data)
 	binary.Read(buffer, binary.BigEndian, &x)
-	if len(this.piecesAvailable) > int((x / 8)) {
-		this.piecesAvailable[x/8] |= (1 << (7 - uint(x%8)))
-	} else {
-		fmt.Println("Have message out of bound:", x, " len of the pieces", len(this.piecesAvailable))
-	}
-}
-
-func (this *PeerClient) back() {
-	m := &this.manager.Blocks
-	size := len(this.manager.MetaData.Info.Pieces) / 20
-	m.Lock.Lock()
-	avail := m.AvailablePieces
-	locked := m.LockedPieces
-	t := false
-	for i := range avail {
-		for j := 0; j < 8; j++ {
-			y := (i * 8) + j
-			if y >= size {
-				break
-			}
-			availBit := avail[i] & (1 << uint(7-j))
-			lockedBit := locked[i] & (1 << uint(7-j))
-			pieceBit := this.piecesAvailable[i] & (1 << uint(7-j))
-			if availBit == 0 && lockedBit == 0 && pieceBit != 0 {
-				this.piece.Id = i*8 + j
-				this.SendPieceRquest()
-				m.LockedPieces[i] |= (1 << uint(7-j))
-				t = true
-				break
-			}
-		}
-		if t {
-			break
-		}
-	}
-	m.Lock.Unlock()
-
+	this.piecesAvailable.LockPiece(int(x))
 }
 
 func (this *PeerClient) Piece(size int) {
@@ -221,16 +174,11 @@ func (this *PeerClient) Piece(size int) {
 	if err != nil {
 		return
 	}
-	this.manager.Blocks.Lock.Lock()
-	if (this.manager.Blocks.AvailablePieces[t.Id/8] & (1 << uint(7-t.Id%8))) == 0 {
-		this.manager.Blocks.AvailablePieces[t.Id/8] |= (1 << uint(7-t.Id%8))
-		this.manager.s.PutBlock(data[8:], int(t.Id))
-		atomic.AddInt32(&currentPiece, 1)
-		fmt.Println(t.Id)
+	if int(t.Id) == this.piece.Id && int(t.Offset) == this.piece.Offset {
+		this.piece.Data.Write(data[8:])
+		this.piece.Offset += len(data[8:])
+		this.managePieceDownload()
 	}
-	this.manager.Blocks.Lock.Unlock()
-	this.piece.Id = -1
-	this.manager.findPiece(this)
 }
 
 func (this *PeerClient) read(length int, duration time.Duration) ([]byte, error) {
@@ -269,9 +217,9 @@ func (this *PeerClient) SendPieceRquest() {
 		this.SendInterested()
 	}
 	p := PieceRequest{
-		Size:   int32(this.piece.Size),
+		Size:   int32(this.piece.BlockSize),
 		Id:     int32(this.piece.Id),
-		Offset: int32(this.piece.offset)}
+		Offset: int32(this.piece.Offset)}
 	buf := bytes.NewBuffer([]byte{6})
 	err := binary.Write(buf, binary.BigEndian, p)
 	if err != nil {
@@ -307,11 +255,9 @@ func (this *PeerClient) kill() {
 
 // Handles all the Peer Wire protocol messages
 func (this *PeerClient) HandleResponse() {
-	atomic.AddInt32(&currentPeers, 1)
 	for {
 		data, err := this.read(5, time.Second*1000)
 		if err != nil {
-			atomic.AddInt32(&currentPeers, -1)
 			break
 		}
 		if len(data) != 5 {
@@ -340,7 +286,26 @@ func (this *PeerClient) HandleResponse() {
 			this.Piece(int(size - 1))
 		default:
 			this.Conn.Close()
-			runtime.Goexit()
 		}
+	}
+	this.manager.unresgisterPeer(this)
+}
+
+func (this *PeerClient) managePieceDownload() {
+	if this.piece.PieceSize == this.piece.Offset {
+		this.manager.StorePiece(this.piece.Id, this.piece.Data.Bytes())
+		this.piece.Lock.Lock()
+		this.piece.Id = -1
+		this.piece.Data.Reset()
+		this.piece.Offset = 0
+		this.piece.Lock.Unlock()
+	} else {
+		size := this.piece.PieceSize - this.piece.Offset
+		if size >= BLOCKSIZE {
+			this.piece.BlockSize = BLOCKSIZE
+		} else {
+			this.piece.BlockSize = size
+		}
+		this.SendPieceRquest()
 	}
 }

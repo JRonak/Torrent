@@ -1,18 +1,40 @@
 package Torrent
 
 import (
+	"crypto/sha1"
 	"fmt"
 	"github.com/JRonak/Torrent/MetaData"
 	"github.com/JRonak/Torrent/Tracker"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
+const (
+	TIMEOUT = 20
+)
+
+var (
+	PIECES int32
+	PEERS  int32
+)
+
+func init() {
+	go trace()
+}
+
+func trace() {
+	for {
+		<-time.After(time.Second * 2)
+		fmt.Printf("\rPeers:%d Pieces%d", atomic.LoadInt32(&PEERS), atomic.LoadInt32(&PIECES))
+	}
+}
+
 type PiecesInfo struct {
 	totalPieces     int
+	AvailablePieces BitMap //Pieces already downloaded
+	LockedPieces    BitMap //Pieces being downloaded
 	Lock            sync.Mutex
-	AvailablePieces []byte //Pieces already downloaded
-	LockedPieces    []byte //Pieces being downloaded
 }
 
 type Manager struct {
@@ -20,18 +42,18 @@ type Manager struct {
 	Blocks   PiecesInfo
 	InfoHash [20]byte
 	PeerId   [20]byte
-	PeerMap  map[Tracker.Peer]*PeerClient
+	PeerMap  map[[20]byte]*PeerClient
 	MapLock  sync.Mutex
-	s        storage
+	Storage  storage
 }
 
 func Init(meta MetaData.MetaInfo) {
 	m := Manager{
 		MetaData: meta,
-		PeerMap:  make(map[Tracker.Peer]*PeerClient)}
+		PeerMap:  make(map[[20]byte]*PeerClient)}
 	_blob := new(blob)
 	_blob.meta = &meta
-	m.s = _blob
+	m.Storage = _blob
 	m.manage()
 }
 
@@ -54,8 +76,13 @@ func (this *Manager) manage() {
 	}
 	this.Blocks.totalPieces = len(this.MetaData.Info.Pieces) / 20
 	fmt.Println(this.Blocks.totalPieces)
-	this.Blocks.AvailablePieces = make([]byte, (this.Blocks.totalPieces/8)+1)
-	this.Blocks.LockedPieces = make([]byte, (this.Blocks.totalPieces/8)+1)
+	this.Blocks.AvailablePieces.Set(make([]byte, (this.Blocks.totalPieces/8)+1))
+	this.Blocks.LockedPieces.Set(make([]byte, (this.Blocks.totalPieces/8)+1))
+	fmt.Println(this.Blocks.AvailablePieces.GetByte(0))
+	go this.peerManager()
+	for i := range this.MetaData.AnnounceList[0] {
+		go this.handleTracker(this.MetaData.AnnounceList[0][i])
+	}
 	this.handleTracker(this.MetaData.Announce)
 }
 
@@ -65,9 +92,8 @@ func (this *Manager) handleTracker(url string) {
 		fmt.Println(err)
 		return
 	}
-	count := 0
-	tracker.SetNumPeers(500)
-	for count != 4 {
+	for count := 0; count != 4; {
+		tracker.SetNumPeers(300)
 		err := tracker.Announce()
 		if err != nil {
 			count++
@@ -75,7 +101,6 @@ func (this *Manager) handleTracker(url string) {
 			continue
 		}
 		count = 0
-		go this.check()
 		go this.spawnPeer(tracker.Peers)
 		<-time.After(time.Second * time.Duration(tracker.Interval()))
 	}
@@ -83,47 +108,64 @@ func (this *Manager) handleTracker(url string) {
 
 func (this *Manager) spawnPeer(peers []Tracker.Peer) {
 	for i := range peers {
-		if this.PeerMap[peers[i]] == nil {
-			p := PeerClient{}
-			p.Peer = peers[i]
-			p.manager = this
-			go p.Intialize()
-		}
+		p := PeerClient{}
+		p.manager = this
+		go p.Intialize(peers[i])
 	}
 }
 
-func (this *Manager) registerPeer(p *PeerClient) {
+func (this *Manager) registerPeer(p *PeerClient) bool {
+	if this.PeerMap[p.PeerId] == nil {
+		this.MapLock.Lock()
+		atomic.AddInt32(&PEERS, 1)
+		this.PeerMap[p.PeerId] = p
+		this.MapLock.Unlock()
+		return true
+	} else {
+		return false
+	}
+}
+
+func (this *Manager) unresgisterPeer(p *PeerClient) {
 	this.MapLock.Lock()
-	this.PeerMap[p.Peer] = p
+	if p.piece.Id != -1 {
+		this.Blocks.LockedPieces.UnlockPiece(p.piece.Id)
+	}
+	atomic.AddInt32(&PEERS, -1)
+	delete(this.PeerMap, p.PeerId)
 	this.MapLock.Unlock()
 }
 
-func (this *Manager) check() {
+func (this *Manager) peerManager() {
+	count := 0
 	for {
-		<-time.After(time.Second * 20)
+		count += 1
+		<-time.After(time.Second * 5)
+		this.MapLock.Lock()
 		for x := range this.PeerMap {
 			p := this.PeerMap[x]
+			p.piece.Lock.Lock()
 			if p.piece.Id != -1 {
-				t := p.piece.stamp
-				t.Add(time.Second * 20)
+				t := p.piece.Stamp
+				t = t.Add(time.Second * TIMEOUT)
 				if time.Now().After(t) {
-					id := p.piece.Id
+					this.Blocks.LockedPieces.UnlockPiece(p.piece.Id)
 					p.piece.Id = -1
-					go this.findPeer(id, p)
 				}
+				p.piece.Lock.Unlock()
+			} else {
+				p.piece.Lock.Unlock()
+				this.findPiece(p)
 			}
 		}
+		this.MapLock.Unlock()
 	}
 }
 
-func (this *Manager) findPeer(id int, dont *PeerClient) {
-	defer func() {
-		if r := recover(); r != nil {
-			fmt.Println("recovered")
-		}
-	}()
+/*
+func (this *Manager) replacePeer(id int, dont *PeerClient) {
 	x := false
-	for iter := 0; iter < 4; iter++ {
+	for {
 		if (this.Blocks.AvailablePieces[id/8] & (1 << uint(7-id%8))) == 0 {
 			for i := range this.PeerMap {
 
@@ -140,7 +182,7 @@ func (this *Manager) findPeer(id int, dont *PeerClient) {
 						p.piece.Size = this.MetaData.Info.PieceLength
 					}
 					fmt.Println("found ", id)
-					p.piece.stamp = time.Now()
+					p.piece.Stamp = time.Now()
 					p.SendPieceRquest()
 					x = true
 					break
@@ -154,45 +196,56 @@ func (this *Manager) findPeer(id int, dont *PeerClient) {
 			}
 		}
 	}
-}
+}*/
 
 func (this *Manager) findPiece(p *PeerClient) {
-	m := &this.Blocks
-	size := m.totalPieces
-	m.Lock.Lock()
-	avail := m.AvailablePieces
-	locked := m.LockedPieces
-	t := false
-	for i := range avail {
-		for j := 0; j < 8; j++ {
-			y := (i * 8) + j
-			if y >= size {
-				break
-			}
-			availBit := avail[i] & (1 << uint(7-j))
-			lockedBit := locked[i] & (1 << uint(7-j))
-			pieceBit := p.piecesAvailable[i] & (1 << uint(7-j))
-			if availBit == 0 && lockedBit == 0 && pieceBit != 0 {
-				if p.piece.Id != -1 {
-					break
+	if p.peerChoked {
+		return
+	}
+	blocks := &this.Blocks
+	blocks.Lock.Lock()
+	status := false
+	for index := 0; index < blocks.totalPieces; index++ {
+		if !blocks.AvailablePieces.IsLocked(index) && !blocks.LockedPieces.IsLocked(index) && p.piecesAvailable.IsLocked(index) {
+			p.piece.Lock.Lock()
+			if p.piece.Id == -1 {
+				if blocks.LockedPieces.LockPiece(index) {
+					p.piece.Id = index
+					if index == (blocks.totalPieces - 1) {
+						p.piece.PieceSize = this.MetaData.Size() % this.MetaData.Info.PieceLength
+					} else {
+						p.piece.PieceSize = this.MetaData.Info.PieceLength
+					}
+					p.piece.Stamp = time.Now()
+					status = true
 				}
-				p.piece.Id = i*8 + j
-				if p.piece.Id == (size - 1) {
-					p.piece.Size = this.MetaData.Size() % this.MetaData.Info.PieceLength
-					fmt.Println(p.piece.Size, "SIze")
-				} else {
-					p.piece.Size = this.MetaData.Info.PieceLength
-				}
-				p.piece.stamp = time.Now()
-				p.SendPieceRquest()
-				m.LockedPieces[i] |= (1 << uint(7-j))
-				t = true
-				break
 			}
+			p.piece.Lock.Unlock()
 		}
-		if t {
+		if status {
+			p.managePieceDownload()
 			break
 		}
 	}
-	m.Lock.Unlock()
+	blocks.Lock.Unlock()
+}
+
+func (this *Manager) StorePiece(index int, data []byte) {
+	if this.Blocks.AvailablePieces.IsLocked(index) {
+		return
+	}
+	hash := sha1.New()
+	hash.Write(data)
+	sum := hash.Sum(nil)
+	piecehash := []byte(this.MetaData.Info.Pieces[(20 * index):((20 * index) + 20)])
+	for i := range sum {
+		if sum[i] != piecehash[i] {
+			this.Blocks.LockedPieces.UnlockPiece(index)
+			break
+		}
+	}
+	if this.Blocks.AvailablePieces.LockPiece(index) {
+		this.Storage.PutBlock(data, index)
+		atomic.AddInt32(&PIECES, 1)
+	}
 }
