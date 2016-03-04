@@ -1,22 +1,23 @@
 package Torrent
 
 import (
+	//"fmt"
 	"sync"
 )
 
-type BitMap struct {
+type BitArray struct {
 	bits int
 	data []byte
 	lock sync.Mutex
 }
 
-func (this *BitMap) Set(data []byte) {
+func (this *BitArray) Set(data []byte) {
 	this.data = data
 	this.bits = len(data) * 8
 }
 
-func (this *BitMap) IsLocked(index int) bool {
-	if this.bits > index {
+func (this *BitArray) IsLocked(index int) bool {
+	if index < this.bits && index >= 0 {
 		if (this.data[index/8] & (1 << (uint(7 - (index % 8))))) > 0 {
 			return true
 		}
@@ -24,9 +25,9 @@ func (this *BitMap) IsLocked(index int) bool {
 	return false
 }
 
-func (this *BitMap) LockPiece(index int) bool {
+func (this *BitArray) LockPiece(index int) bool {
 	status := false
-	if this.bits > index {
+	if index < this.bits && index >= 0 {
 		this.lock.Lock()
 		if this.IsLocked(index) == false {
 			this.data[index/8] |= (1 << uint(7-(index%8)))
@@ -37,7 +38,7 @@ func (this *BitMap) LockPiece(index int) bool {
 	return status
 }
 
-func (this *BitMap) UnlockPiece(index int) {
+func (this *BitArray) UnlockPiece(index int) {
 	if index < this.bits {
 		this.lock.Lock()
 		negation := byte(0xff ^ (1 << uint(7-index%8)))
@@ -46,9 +47,13 @@ func (this *BitMap) UnlockPiece(index int) {
 	}
 }
 
-func (this *BitMap) GetByte(index int) byte {
+func (this *BitArray) GetByte(index int) byte {
 	if index < this.bits {
 		return this.data[index/8]
 	}
 	return 0
+}
+
+func (this *BitArray) GetArray() []byte {
+	return this.data
 }
