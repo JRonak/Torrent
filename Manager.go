@@ -64,7 +64,7 @@ func Init(meta *MetaData.MetaInfo) {
 	m := Manager{
 		MetaData: meta,
 		PeerMap:  make(map[[20]byte]*PeerClient)}
-	_blob := new(blob)
+	_blob := new(FileStorage)
 	m.Storage = _blob
 	m.Blocks.totalPieces = len(m.MetaData.Info.Pieces) / 20
 	m.Blocks.AvailablePieces.Set(make([]byte, (m.Blocks.totalPieces/8)+1))
@@ -75,7 +75,6 @@ func Init(meta *MetaData.MetaInfo) {
 	if !m.Storage.Init(meta) {
 		m.pieceCheck()
 	}
-	//go m.test()
 	go m.display()
 	m.manage()
 }
